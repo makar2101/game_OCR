@@ -1,23 +1,26 @@
-﻿# Core dependencies
+﻿# Core dependencies for Skyrim Dialogue Analyzer
 opencv-python>=4.5.0
-easyocr>=1.6.0
-Pillow>=8.0.0
 numpy>=1.21.0
-requests>=2.25.0
-pyyaml>=5.4.0
+Pillow>=8.0.0
 
 # Video processing
 ffmpeg-python>=0.2.0
 
-# GUI framework (Tkinter вже вбудований в Python)
-# tkinter # Вбудований модуль
-
 # Utilities
 tqdm>=4.62.0
 python-dateutil>=2.8.0
-pathlib2>=2.3.6
 
-# Development tools
+# Future OCR dependencies (will be added later)
+# easyocr>=1.6.0  # Uncomment when we implement OCR module
+
+# YAML configuration support
+pyyaml>=5.4.0
+
+# Requests for future AI integration
+requests>=2.25.0
+
+# Development and testing
 pytest>=6.0.0
-black>=21.0.0
-flake8>=3.9.0
+
+# Data processing
+pandas>=1.3.0

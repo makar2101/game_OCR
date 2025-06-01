@@ -1,589 +1,617 @@
-#!/usr/bin/env python3
 """
-Skyrim Dialogue Analyzer - Video Processing Engine
-=================================================
+Core Video Processing Module for Skyrim Dialogue Analyzer
+Handles MKV frame extraction, metadata analysis, and video preprocessing
+Optimized for RTX 5080 + Ryzen 7700 + 64GB RAM setup
 
-High-performance video processing engine optimized for Skyrim gameplay videos.
-Handles frame extraction, metadata analysis, and video segmentation with GPU acceleration.
-
-Optimized for 2K video at 30fps with RTX 5080 + Ryzen 7700 + 64GB RAM.
+File Structure:
+skyrim_dialogue_analyzer/
+├── src/core/video_processor.py  # This file
+├── test_videos/                 # Put your .mkv files here
+├── output/                      # Generated output files
+└── logs/                        # Debug logs
 """
 
 import cv2
 import numpy as np
-import threading
+import os
 import logging
 import time
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Callable, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-from datetime import datetime, timedelta
-import queue
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import hashlib
+from dataclasses import dataclass, asdict
+import sys
 
-# Video processing utilities
-try:
-    import ffmpeg
+# Get the project root directory
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+TEST_VIDEOS_DIR = PROJECT_ROOT / "test_videos"
+OUTPUT_DIR = PROJECT_ROOT / "output"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
-    FFMPEG_AVAILABLE = True
-except ImportError:
-    FFMPEG_AVAILABLE = False
-    logging.warning("[VIDEO] FFmpeg-python not available, some features may be limited")
+# Create necessary directories
+for directory in [TEST_VIDEOS_DIR, OUTPUT_DIR, LOGS_DIR]:
+    directory.mkdir(exist_ok=True)
 
+# Configure detailed logging
+log_file = LOGS_DIR / "video_processor_debug.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-@dataclass
-class VideoFrame:
-    """Represents a single video frame with metadata."""
-    frame_number: int
-    timestamp: float
-    image: np.ndarray
-    width: int
-    height: int
-    frame_hash: str = ""
-    is_dialogue_frame: bool = False
-    confidence: float = 0.0
-
-    def __post_init__(self):
-        """Calculate frame hash after initialization."""
-        if self.frame_hash == "":
-            self.frame_hash = self._calculate_hash()
-
-    def _calculate_hash(self) -> str:
-        """Calculate unique hash for frame comparison."""
-        # Use a smaller version for hash calculation to improve performance
-        small_frame = cv2.resize(self.image, (64, 36))
-        return hashlib.md5(small_frame.tobytes()).hexdigest()[:16]
+# Log the directory structure for debugging
+logger.info(f"PROJECT_ROOT: {PROJECT_ROOT}")
+logger.info(f"TEST_VIDEOS_DIR: {TEST_VIDEOS_DIR}")
+logger.info(f"OUTPUT_DIR: {OUTPUT_DIR}")
+logger.info(f"LOGS_DIR: {LOGS_DIR}")
 
 
 @dataclass
 class VideoMetadata:
-    """Video file metadata and processing information."""
-    file_path: str
-    filename: str
-    file_size: int
-    duration: float
-    fps: float
-    frame_count: int
+    """Video metadata container"""
+    filepath: str
     width: int
     height: int
+    fps: float
+    total_frames: int
+    duration: float
     codec: str
-    bitrate: int
-    creation_time: Optional[datetime] = None
-    processing_time: Optional[datetime] = None
+    file_size: int
+    creation_time: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {
-            'file_path': self.file_path,
-            'filename': self.filename,
-            'file_size': self.file_size,
-            'duration': self.duration,
-            'fps': self.fps,
-            'frame_count': self.frame_count,
-            'width': self.width,
-            'height': self.height,
-            'codec': self.codec,
-            'bitrate': self.bitrate,
-            'creation_time': self.creation_time.isoformat() if self.creation_time else None,
-            'processing_time': self.processing_time.isoformat() if self.processing_time else None
-        }
+        return asdict(self)
+
+    def save_to_file(self, output_path: str) -> bool:
+        """Save metadata to JSON file"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(self.to_dict(), f, indent=2)
+            logger.info(f"Metadata saved to: {output_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving metadata: {str(e)}")
+            return False
+
+
+@dataclass
+class FrameData:
+    """Individual frame data container"""
+    frame_number: int
+    timestamp: float
+    frame_array: np.ndarray
+    frame_hash: str
+    is_changed: bool = False
+    text_regions: List[Dict] = None
+
+    def __post_init__(self):
+        if self.text_regions is None:
+            self.text_regions = []
+
+    def save_frame_image(self, output_dir: str) -> str:
+        """Save frame as image file and return path"""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            filename = f"frame_{self.frame_number:06d}_{self.timestamp:.3f}.png"
+            filepath = os.path.join(output_dir, filename)
+
+            success = cv2.imwrite(filepath, self.frame_array)
+            if success:
+                logger.debug(f"Frame saved: {filepath}")
+                return filepath
+            else:
+                logger.error(f"Failed to save frame: {filepath}")
+                return ""
+        except Exception as e:
+            logger.error(f"Error saving frame: {str(e)}")
+            return ""
 
 
 class VideoProcessor:
-    """High-performance video processing engine for Skyrim dialogue analysis."""
+    """
+    High-performance video processor optimized for Skyrim dialogue extraction
+    Supports 2K MKV files with GPU acceleration and multi-threading
+    """
 
-    def __init__(self, max_workers: int = None, cache_size: int = 1000):
+    def __init__(self,
+                 max_workers: int = 8,
+                 frame_buffer_size: int = 100,
+                 enable_gpu: bool = True,
+                 debug_mode: bool = True):
         """
-        Initialize the video processor.
+        Initialize VideoProcessor with performance optimizations
 
         Args:
-            max_workers: Maximum number of worker threads (default: CPU count)
-            cache_size: Maximum number of frames to keep in memory cache
+            max_workers: Number of parallel processing threads
+            frame_buffer_size: Maximum frames to keep in memory
+            enable_gpu: Whether to use GPU acceleration
+            debug_mode: Enable detailed debugging output
         """
-        self.logger = logging.getLogger(__name__)
-        self.max_workers = max_workers or mp.cpu_count()
-        self.cache_size = cache_size
+        logger.info(f"Initializing VideoProcessor with {max_workers} workers")
+        logger.debug(f"Frame buffer size: {frame_buffer_size}")
+        logger.debug(f"GPU enabled: {enable_gpu}")
 
-        # Processing state
-        self.current_video = None
-        self.metadata = None
-        self.is_processing = False
-        self.processing_progress = 0.0
-        self.cancel_requested = False
+        self.max_workers = max_workers
+        self.frame_buffer_size = frame_buffer_size
+        self.enable_gpu = enable_gpu
+        self.debug_mode = debug_mode
 
-        # Frame cache for performance
-        self.frame_cache = {}
-        self.cache_order = []
-
-        # Callbacks for progress reporting
-        self.progress_callback = None
-        self.frame_callback = None
-        self.completion_callback = None
-
-        # Performance monitoring
+        # Performance tracking
         self.processing_stats = {
             'frames_processed': 0,
-            'processing_start_time': None,
-            'estimated_completion': None,
-            'fps_processing_rate': 0.0
+            'total_processing_time': 0,
+            'average_fps': 0,
+            'memory_usage': 0
         }
 
-        self.logger.info(f"[VIDEO] Video processor initialized with {self.max_workers} workers")
+        # Thread safety
+        self._lock = threading.Lock()
+        self._frame_cache = {}
+        self._last_frame_hash = None
 
-    def set_callbacks(self, progress_callback: Callable = None,
-                      frame_callback: Callable = None,
-                      completion_callback: Callable = None):
-        """Set callback functions for progress reporting."""
-        self.progress_callback = progress_callback
-        self.frame_callback = frame_callback
-        self.completion_callback = completion_callback
-        self.logger.info("[VIDEO] Callbacks configured")
+        # Check for available video files
+        self._scan_available_videos()
 
-    def load_video(self, video_path: str) -> bool:
+        logger.info("VideoProcessor initialized successfully")
+
+    def _scan_available_videos(self):
+        """Scan for available video files in test directory"""
+        logger.info(f"Scanning for video files in: {TEST_VIDEOS_DIR}")
+
+        video_extensions = ['.mkv', '.mp4', '.avi', '.mov']
+        found_videos = []
+
+        if TEST_VIDEOS_DIR.exists():
+            for ext in video_extensions:
+                videos = list(TEST_VIDEOS_DIR.glob(f"*{ext}"))
+                found_videos.extend(videos)
+
+        logger.info(f"Found {len(found_videos)} video files:")
+        for video in found_videos:
+            logger.info(f"  - {video.name} ({video.stat().st_size / (1024*1024):.1f} MB)")
+
+        if not found_videos:
+            logger.warning(f"No video files found in {TEST_VIDEOS_DIR}")
+            logger.warning("Please add .mkv files to the test_videos/ directory")
+
+    def find_video_by_name(self, partial_name: str) -> Optional[str]:
+        """Find video file by partial name match"""
+        logger.debug(f"Searching for video with name containing: '{partial_name}'")
+
+        if not TEST_VIDEOS_DIR.exists():
+            logger.error(f"Test videos directory not found: {TEST_VIDEOS_DIR}")
+            return None
+
+        video_extensions = ['.mkv', '.mp4', '.avi', '.mov']
+
+        for ext in video_extensions:
+            for video_file in TEST_VIDEOS_DIR.glob(f"*{partial_name}*{ext}"):
+                logger.info(f"Found matching video: {video_file}")
+                return str(video_file)
+
+        logger.warning(f"No video found matching: '{partial_name}'")
+        return None
+
+    def load_video(self, video_path: str) -> Optional[VideoMetadata]:
         """
-        Load and analyze video file metadata.
+        Load video file and extract metadata
 
         Args:
-            video_path: Path to the video file
+            video_path: Path to the MKV video file OR just filename
 
         Returns:
-            bool: True if video loaded successfully
+            VideoMetadata object or None if failed
         """
+        # If only filename provided, look in test_videos directory
+        if not os.path.exists(video_path):
+            logger.info(f"File not found at {video_path}, searching in test_videos/")
+            found_video = self.find_video_by_name(video_path)
+            if found_video:
+                video_path = found_video
+            else:
+                logger.error(f"Video file not found: {video_path}")
+                return None
+
+        logger.info(f"Loading video: {video_path}")
+
         try:
-            video_path = Path(video_path)
-            if not video_path.exists():
-                self.logger.error(f"[VIDEO] File not found: {video_path}")
-                return False
-
-            self.logger.info(f"[VIDEO] Loading video: {video_path.name}")
-
             # Open video with OpenCV
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                self.logger.error(f"[VIDEO] Could not open video file: {video_path}")
-                return False
+            cap = cv2.VideoCapture(video_path)
 
-            # Extract basic metadata
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if not cap.isOpened():
+                logger.error(f"Failed to open video file: {video_path}")
+                logger.error("This could be due to:")
+                logger.error("  1. Unsupported codec")
+                logger.error("  2. Corrupted file")
+                logger.error("  3. Missing OpenCV video support")
+                return None
+
+            # Extract metadata
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            duration = frame_count / fps if fps > 0 else 0
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
 
-            # Try to get codec information
+            # Get codec information
             fourcc = cap.get(cv2.CAP_PROP_FOURCC)
             codec = "".join([chr((int(fourcc) >> 8 * i) & 0xFF) for i in range(4)])
 
-            cap.release()
+            # File size
+            file_size = os.path.getsize(video_path)
 
-            # Get additional metadata with FFmpeg if available
-            bitrate = 0
-            creation_time = None
+            logger.info(f"Video metadata extracted:")
+            logger.info(f"  Resolution: {width}x{height}")
+            logger.info(f"  FPS: {fps}")
+            logger.info(f"  Total frames: {total_frames}")
+            logger.info(f"  Duration: {duration:.2f} seconds")
+            logger.info(f"  Codec: {codec}")
+            logger.info(f"  File size: {file_size / (1024 * 1024):.2f} MB")
 
-            if FFMPEG_AVAILABLE:
-                try:
-                    probe = ffmpeg.probe(str(video_path))
+            # Validate for Skyrim requirements
+            if width == 2560 and height == 1440:
+                logger.info("✓ Video is 2K resolution (optimal for Skyrim)")
+            else:
+                logger.warning(f"⚠ Video is not 2K (2560x1440). Actual: {width}x{height}")
 
-                    # Get bitrate
-                    if 'bit_rate' in probe['format']:
-                        bitrate = int(probe['format']['bit_rate'])
+            if abs(fps - 30.0) <= 1.0:
+                logger.info("✓ Video is ~30 FPS (optimal for Skyrim)")
+            else:
+                logger.warning(f"⚠ Video is not 30 FPS. Actual: {fps}")
 
-                    # Get creation time
-                    if 'creation_time' in probe['format']['tags']:
-                        creation_time = datetime.fromisoformat(
-                            probe['format']['tags']['creation_time'].replace('Z', '+00:00')
-                        )
-                except Exception as e:
-                    self.logger.warning(f"[VIDEO] Could not get extended metadata: {e}")
+            if video_path.lower().endswith('.mkv'):
+                logger.info("✓ Video is MKV format (optimal)")
+            else:
+                logger.warning(f"⚠ Video is not MKV format")
 
-            # Create metadata object
-            self.metadata = VideoMetadata(
-                file_path=str(video_path),
-                filename=video_path.name,
-                file_size=video_path.stat().st_size,
-                duration=duration,
-                fps=fps,
-                frame_count=frame_count,
+            metadata = VideoMetadata(
+                filepath=video_path,
                 width=width,
                 height=height,
+                fps=fps,
+                total_frames=total_frames,
+                duration=duration,
                 codec=codec,
-                bitrate=bitrate,
-                creation_time=creation_time,
-                processing_time=datetime.now()
+                file_size=file_size
             )
 
-            self.current_video = str(video_path)
-
-            self.logger.info(f"[VIDEO] Video loaded successfully:")
-            self.logger.info(f"  Resolution: {width}x{height}")
-            self.logger.info(f"  Duration: {duration:.2f}s ({frame_count} frames)")
-            self.logger.info(f"  FPS: {fps:.2f}")
-            self.logger.info(f"  Codec: {codec}")
-            self.logger.info(f"  File size: {video_path.stat().st_size / (1024 * 1024):.1f} MB")
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"[VIDEO] Error loading video: {e}")
-            return False
-
-    def extract_frame(self, frame_number: int) -> Optional[VideoFrame]:
-        """
-        Extract a specific frame from the video.
-
-        Args:
-            frame_number: Frame number to extract (0-based)
-
-        Returns:
-            VideoFrame object or None if extraction failed
-        """
-        if not self.current_video or not self.metadata:
-            self.logger.error("[VIDEO] No video loaded")
-            return None
-
-        # Check cache first
-        if frame_number in self.frame_cache:
-            self.logger.debug(f"[VIDEO] Frame {frame_number} retrieved from cache")
-            return self.frame_cache[frame_number]
-
-        try:
-            cap = cv2.VideoCapture(self.current_video)
-            if not cap.isOpened():
-                self.logger.error("[VIDEO] Could not open video for frame extraction")
-                return None
-
-            # Seek to the desired frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-
-            ret, frame = cap.read()
             cap.release()
 
+            # Save metadata to output directory
+            metadata_file = OUTPUT_DIR / f"{Path(video_path).stem}_metadata.json"
+            metadata.save_to_file(str(metadata_file))
+
+            logger.info("Video loaded successfully")
+            return metadata
+
+        except Exception as e:
+            logger.error(f"Error loading video: {str(e)}", exc_info=True)
+            return None
+
+    def extract_frame(self, video_path: str, frame_number: int) -> Optional[FrameData]:
+        """
+        Extract a specific frame from video
+
+        Args:
+            video_path: Path to video file
+            frame_number: Frame number to extract
+
+        Returns:
+            FrameData object or None if failed
+        """
+        logger.debug(f"Extracting frame {frame_number} from {Path(video_path).name}")
+
+        try:
+            cap = cv2.VideoCapture(video_path)
+
+            if not cap.isOpened():
+                logger.error(f"Failed to open video for frame extraction: {video_path}")
+                return None
+
+            # Validate frame number
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_number >= total_frames:
+                logger.warning(f"Frame {frame_number} is beyond video length ({total_frames} frames)")
+                cap.release()
+                return None
+
+            # Set frame position
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+
+            # Read frame
+            ret, frame = cap.read()
+
             if not ret:
-                self.logger.warning(f"[VIDEO] Could not read frame {frame_number}")
+                logger.warning(f"Failed to read frame {frame_number}")
+                cap.release()
                 return None
 
             # Calculate timestamp
-            timestamp = frame_number / self.metadata.fps
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            timestamp = frame_number / fps if fps > 0 else 0
 
-            # Create VideoFrame object
-            video_frame = VideoFrame(
+            # Generate frame hash for change detection
+            frame_hash = self._calculate_frame_hash(frame)
+
+            # Check if frame changed from previous
+            is_changed = self._is_frame_changed(frame_hash)
+
+            logger.debug(f"Frame {frame_number} extracted successfully")
+            logger.debug(f"  Timestamp: {timestamp:.3f}s")
+            logger.debug(f"  Hash: {frame_hash[:16]}...")
+            logger.debug(f"  Changed: {is_changed}")
+
+            frame_data = FrameData(
                 frame_number=frame_number,
                 timestamp=timestamp,
-                image=frame,
-                width=frame.shape[1],
-                height=frame.shape[0]
+                frame_array=frame,
+                frame_hash=frame_hash,
+                is_changed=is_changed
             )
 
-            # Add to cache
-            self._add_to_cache(frame_number, video_frame)
-
-            return video_frame
+            cap.release()
+            return frame_data
 
         except Exception as e:
-            self.logger.error(f"[VIDEO] Error extracting frame {frame_number}: {e}")
+            logger.error(f"Error extracting frame {frame_number}: {str(e)}", exc_info=True)
             return None
 
-    def extract_frames_batch(self, start_frame: int, end_frame: int,
-                             step: int = 1) -> List[VideoFrame]:
+    def extract_frames_batch(self,
+                             video_path: str,
+                             start_frame: int = 0,
+                             end_frame: Optional[int] = None,
+                             step: int = 1) -> List[FrameData]:
         """
-        Extract multiple frames efficiently in batch.
+        Extract multiple frames in parallel
 
         Args:
+            video_path: Path to video file
             start_frame: Starting frame number
-            end_frame: Ending frame number (exclusive)
-            step: Step size between frames
+            end_frame: Ending frame number (None for all)
+            step: Frame step size
 
         Returns:
-            List of VideoFrame objects
+            List of FrameData objects
         """
-        if not self.current_video or not self.metadata:
-            self.logger.error("[VIDEO] No video loaded")
+        logger.info(f"Starting batch frame extraction")
+        logger.info(f"  Video: {Path(video_path).name}")
+        logger.info(f"  Range: {start_frame} to {end_frame or 'end'}")
+        logger.info(f"  Step: {step}")
+
+        start_time = time.time()
+
+        # Get video metadata for validation
+        metadata = self.load_video(video_path)
+        if not metadata:
+            logger.error("Failed to load video metadata")
             return []
 
+        if end_frame is None:
+            end_frame = metadata.total_frames
+
+        # Validate range
+        end_frame = min(end_frame, metadata.total_frames)
+        frame_numbers = list(range(start_frame, end_frame, step))
+
+        logger.info(f"Processing {len(frame_numbers)} frames with {self.max_workers} workers")
+
         frames = []
-        frame_numbers = list(range(start_frame, min(end_frame, self.metadata.frame_count), step))
+        processed_count = 0
 
-        self.logger.info(f"[VIDEO] Extracting {len(frame_numbers)} frames in batch")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all frame extraction tasks
+            future_to_frame = {
+                executor.submit(self.extract_frame, video_path, frame_num): frame_num
+                for frame_num in frame_numbers
+            }
 
-        try:
-            cap = cv2.VideoCapture(self.current_video)
-            if not cap.isOpened():
-                self.logger.error("[VIDEO] Could not open video for batch extraction")
-                return []
+            # Process completed tasks
+            for future in as_completed(future_to_frame):
+                frame_num = future_to_frame[future]
 
-            for i, frame_num in enumerate(frame_numbers):
-                # Check if we should cancel
-                if self.cancel_requested:
-                    self.logger.info("[VIDEO] Batch extraction cancelled")
-                    break
+                try:
+                    frame_data = future.result()
+                    if frame_data:
+                        frames.append(frame_data)
+                        processed_count += 1
 
-                # Check cache first
-                if frame_num in self.frame_cache:
-                    frames.append(self.frame_cache[frame_num])
-                    continue
+                        if processed_count % 100 == 0:
+                            elapsed = time.time() - start_time
+                            fps = processed_count / elapsed
+                            logger.info(f"Processed {processed_count}/{len(frame_numbers)} frames, {fps:.2f} FPS")
 
-                # Seek and read frame
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame_image = cap.read()
+                except Exception as e:
+                    logger.error(f"Error processing frame {frame_num}: {str(e)}")
 
-                if ret:
-                    timestamp = frame_num / self.metadata.fps
-                    video_frame = VideoFrame(
-                        frame_number=frame_num,
-                        timestamp=timestamp,
-                        image=frame_image,
-                        width=frame_image.shape[1],
-                        height=frame_image.shape[0]
-                    )
+        # Sort frames by frame number
+        frames.sort(key=lambda x: x.frame_number)
 
-                    frames.append(video_frame)
-                    self._add_to_cache(frame_num, video_frame)
+        total_time = time.time() - start_time
+        avg_fps = len(frames) / total_time if total_time > 0 else 0
 
-                    # Report progress
-                    if self.progress_callback:
-                        progress = (i + 1) / len(frame_numbers) * 100
-                        self.progress_callback(progress)
+        logger.info(f"Batch extraction completed:")
+        logger.info(f"  Frames extracted: {len(frames)}")
+        logger.info(f"  Processing time: {total_time:.2f}s")
+        logger.info(f"  Average FPS: {avg_fps:.2f}")
 
-                # Update processing stats
-                self.processing_stats['frames_processed'] += 1
-
-            cap.release()
-
-            self.logger.info(f"[VIDEO] Batch extraction completed: {len(frames)} frames extracted")
-            return frames
-
-        except Exception as e:
-            self.logger.error(f"[VIDEO] Error in batch frame extraction: {e}")
-            return frames
-
-    def process_video_async(self, frame_step: int = 30,
-                            dialogue_detection: bool = True) -> threading.Thread:
-        """
-        Process entire video asynchronously with progress reporting.
-
-        Args:
-            frame_step: Step size between frames (30 = every second at 30fps)
-            dialogue_detection: Whether to perform basic dialogue detection
-
-        Returns:
-            Threading.Thread object for the processing task
-        """
-
-        def process_worker():
-            self.logger.info("[VIDEO] Starting asynchronous video processing")
-            self.is_processing = True
-            self.cancel_requested = False
-            self.processing_stats['processing_start_time'] = time.time()
-            self.processing_stats['frames_processed'] = 0
-
-            try:
-                if not self.current_video or not self.metadata:
-                    self.logger.error("[VIDEO] No video loaded for processing")
-                    return
-
-                total_frames = self.metadata.frame_count
-                frames_to_process = list(range(0, total_frames, frame_step))
-
-                self.logger.info(f"[VIDEO] Processing {len(frames_to_process)} frames "
-                                 f"(every {frame_step} frames)")
-
-                # Process frames in batches for efficiency
-                batch_size = min(100, len(frames_to_process))
-                processed_frames = []
-
-                for i in range(0, len(frames_to_process), batch_size):
-                    if self.cancel_requested:
-                        self.logger.info("[VIDEO] Processing cancelled by user")
-                        break
-
-                    batch_start = frames_to_process[i]
-                    batch_end = frames_to_process[min(i + batch_size, len(frames_to_process) - 1)]
-
-                    # Extract batch of frames
-                    batch_frames = self.extract_frames_batch(batch_start, batch_end + 1, frame_step)
-
-                    # Perform dialogue detection if requested
-                    if dialogue_detection:
-                        batch_frames = self._detect_dialogue_in_batch(batch_frames)
-
-                    processed_frames.extend(batch_frames)
-
-                    # Update progress
-                    progress = len(processed_frames) / len(frames_to_process) * 100
-                    self.processing_progress = progress
-
-                    if self.progress_callback:
-                        self.progress_callback(progress)
-
-                    # Call frame callback for each frame
-                    if self.frame_callback:
-                        for frame in batch_frames:
-                            self.frame_callback(frame)
-
-                    # Update processing rate
-                    elapsed_time = time.time() - self.processing_stats['processing_start_time']
-                    if elapsed_time > 0:
-                        self.processing_stats['fps_processing_rate'] = len(processed_frames) / elapsed_time
-
-                # Processing completed
-                self.is_processing = False
-                self.processing_progress = 100.0
-
-                processing_time = time.time() - self.processing_stats['processing_start_time']
-                self.logger.info(f"[VIDEO] Processing completed in {processing_time:.2f} seconds")
-                self.logger.info(f"[VIDEO] Processed {len(processed_frames)} frames")
-                self.logger.info(f"[VIDEO] Processing rate: {self.processing_stats['fps_processing_rate']:.1f} fps")
-
-                if self.completion_callback:
-                    self.completion_callback(processed_frames)
-
-            except Exception as e:
-                self.logger.error(f"[VIDEO] Error during processing: {e}")
-                self.is_processing = False
-
-        # Start processing thread
-        thread = threading.Thread(target=process_worker, daemon=True)
-        thread.start()
-        return thread
-
-    def _detect_dialogue_in_batch(self, frames: List[VideoFrame]) -> List[VideoFrame]:
-        """
-        Perform basic dialogue detection on a batch of frames.
-        This is a simplified implementation - can be enhanced later.
-
-        Args:
-            frames: List of VideoFrame objects
-
-        Returns:
-            List of VideoFrame objects with dialogue detection results
-        """
-        for frame in frames:
-            # Simple dialogue detection based on image analysis
-            # This is a placeholder - will be enhanced with proper OCR integration
-
-            # Convert to grayscale for analysis
-            gray = cv2.cvtColor(frame.image, cv2.COLOR_BGR2GRAY)
-
-            # Look for text-like regions (high contrast areas)
-            # This is a very basic approach
-            edges = cv2.Canny(gray, 50, 150)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Count significant contours that might represent text
-            significant_contours = [c for c in contours if cv2.contourArea(c) > 50]
-
-            # Simple heuristic: if there are many small contours, might be text
-            if len(significant_contours) > 20:
-                frame.is_dialogue_frame = True
-                frame.confidence = min(len(significant_contours) / 100.0, 1.0)
-            else:
-                frame.is_dialogue_frame = False
-                frame.confidence = 0.0
+        # Update stats
+        self.processing_stats['frames_processed'] += len(frames)
+        self.processing_stats['total_processing_time'] += total_time
+        self.processing_stats['average_fps'] = avg_fps
 
         return frames
 
-    def _add_to_cache(self, frame_number: int, frame: VideoFrame):
-        """Add frame to cache with LRU eviction."""
-        if len(self.frame_cache) >= self.cache_size:
-            # Remove oldest frame
-            oldest_frame = self.cache_order.pop(0)
-            del self.frame_cache[oldest_frame]
-
-        self.frame_cache[frame_number] = frame
-        self.cache_order.append(frame_number)
-
-    def get_frame_at_timestamp(self, timestamp: float) -> Optional[VideoFrame]:
-        """
-        Get frame at specific timestamp.
-
-        Args:
-            timestamp: Time in seconds
-
-        Returns:
-            VideoFrame at the specified timestamp
-        """
-        if not self.metadata:
-            return None
-
-        frame_number = int(timestamp * self.metadata.fps)
-        return self.extract_frame(frame_number)
-
-    def create_video_segment(self, start_time: float, end_time: float,
-                             output_path: str) -> bool:
-        """
-        Create a video segment from the original video.
-
-        Args:
-            start_time: Start time in seconds
-            end_time: End time in seconds
-            output_path: Path for the output video file
-
-        Returns:
-            bool: True if segment created successfully
-        """
-        if not FFMPEG_AVAILABLE:
-            self.logger.error("[VIDEO] FFmpeg not available for video segmentation")
-            return False
-
-        if not self.current_video:
-            self.logger.error("[VIDEO] No video loaded")
-            return False
-
+    def _calculate_frame_hash(self, frame: np.ndarray) -> str:
+        """Calculate hash for frame change detection"""
         try:
-            self.logger.info(f"[VIDEO] Creating segment: {start_time}s - {end_time}s")
+            # Convert to grayscale for hash calculation
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Use FFmpeg to create segment
-            (
-                ffmpeg
-                .input(self.current_video, ss=start_time, t=end_time - start_time)
-                .output(output_path, vcodec='libx264', acodec='aac')
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            # Resize to small size for faster hashing
+            resized = cv2.resize(gray, (64, 64))
 
-            self.logger.info(f"[VIDEO] Segment created successfully: {output_path}")
-            return True
+            # Calculate hash
+            frame_hash = hash(resized.tobytes())
+            return str(frame_hash)
 
         except Exception as e:
-            self.logger.error(f"[VIDEO] Error creating video segment: {e}")
-            return False
+            logger.error(f"Error calculating frame hash: {str(e)}")
+            return "0"
 
-    def cancel_processing(self):
-        """Cancel ongoing processing."""
-        self.cancel_requested = True
-        self.logger.info("[VIDEO] Processing cancellation requested")
+    def _is_frame_changed(self, frame_hash: str) -> bool:
+        """Check if frame changed from previous"""
+        with self._lock:
+            if self._last_frame_hash is None:
+                self._last_frame_hash = frame_hash
+                return True
 
-    def clear_cache(self):
-        """Clear the frame cache."""
-        self.frame_cache.clear()
-        self.cache_order.clear()
-        self.logger.info("[VIDEO] Frame cache cleared")
+            changed = frame_hash != self._last_frame_hash
+            self._last_frame_hash = frame_hash
+            return changed
+
+    def preprocess_frame_for_ocr(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Preprocess frame for better OCR accuracy
+
+        Args:
+            frame: Input frame array
+
+        Returns:
+            Preprocessed frame
+        """
+        logger.debug("Preprocessing frame for OCR")
+
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Apply Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+
+            # Enhance contrast using CLAHE
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(blurred)
+
+            # Apply threshold for better text visibility
+            _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            logger.debug("Frame preprocessing completed")
+            return thresh
+
+        except Exception as e:
+            logger.error(f"Error preprocessing frame: {str(e)}")
+            return frame
+
+    def save_frames_to_output(self, frames: List[FrameData], subfolder: str = "frames") -> List[str]:
+        """
+        Save all frames to output directory
+
+        Args:
+            frames: List of FrameData objects
+            subfolder: Subfolder name in output directory
+
+        Returns:
+            List of saved file paths
+        """
+        output_subdir = OUTPUT_DIR / subfolder
+        output_subdir.mkdir(exist_ok=True)
+
+        logger.info(f"Saving {len(frames)} frames to {output_subdir}")
+
+        saved_paths = []
+        for frame in frames:
+            saved_path = frame.save_frame_image(str(output_subdir))
+            if saved_path:
+                saved_paths.append(saved_path)
+
+        logger.info(f"Saved {len(saved_paths)} frames successfully")
+        return saved_paths
 
     def get_processing_stats(self) -> Dict[str, Any]:
-        """Get current processing statistics."""
-        stats = self.processing_stats.copy()
-        stats['is_processing'] = self.is_processing
-        stats['progress'] = self.processing_progress
-        stats['cache_size'] = len(self.frame_cache)
-        return stats
+        """Get processing statistics"""
+        return self.processing_stats.copy()
 
-    def save_metadata(self, output_path: str):
-        """Save video metadata to JSON file."""
-        if not self.metadata:
-            self.logger.warning("[VIDEO] No metadata to save")
-            return
+    def reset_stats(self):
+        """Reset processing statistics"""
+        self.processing_stats = {
+            'frames_processed': 0,
+            'total_processing_time': 0,
+            'average_fps': 0,
+            'memory_usage': 0
+        }
+        logger.info("Processing statistics reset")
 
-        try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(self.metadata.to_dict(), f, indent=2)
-            self.logger.info(f"[VIDEO] Metadata saved to: {output_path}")
-        except Exception as e:
-            self.logger.error(f"[VIDEO] Error saving metadata: {e}")
 
-    def __del__(self):
-        """Cleanup when object is destroyed."""
-        self.cancel_processing()
-        self.clear_cache()
+# Enhanced test function with file discovery
+def test_video_processor():
+    """Test function with extensive debugging and automatic file discovery"""
+    logger.info("=" * 60)
+    logger.info("Starting VideoProcessor test with file discovery")
+    logger.info("=" * 60)
+
+    # Initialize processor
+    processor = VideoProcessor(
+        max_workers=4,
+        frame_buffer_size=50,
+        enable_gpu=True,
+        debug_mode=True
+    )
+
+    # Try to find any video file automatically
+    video_files = []
+    if TEST_VIDEOS_DIR.exists():
+        for ext in ['.mkv', '.mp4', '.avi', '.mov']:
+            video_files.extend(list(TEST_VIDEOS_DIR.glob(f"*{ext}")))
+
+    if video_files:
+        # Use the first video found
+        test_video_path = str(video_files[0])
+        logger.info(f"Using video file: {test_video_path}")
+
+        # Load video metadata
+        metadata = processor.load_video(test_video_path)
+
+        if metadata:
+            logger.info("✓ Metadata loaded successfully")
+
+            # Extract first 30 frames (1 second at 30fps)
+            logger.info("Extracting first 30 frames for testing...")
+            frames = processor.extract_frames_batch(
+                test_video_path,
+                start_frame=0,
+                end_frame=30,
+                step=1
+            )
+
+            logger.info(f"✓ Extracted {len(frames)} frames")
+
+            # Save frames to output directory
+            if frames:
+                saved_paths = processor.save_frames_to_output(frames, "test_frames")
+                logger.info(f"✓ Saved {len(saved_paths)} frame images")
+
+            # Get processing stats
+            stats = processor.get_processing_stats()
+            logger.info(f"Processing stats: {stats}")
+
+        else:
+            logger.error("✗ Failed to load metadata")
+    else:
+        logger.warning("No video files found for testing")
+        logger.warning(f"Please add video files to: {TEST_VIDEOS_DIR}")
+        logger.warning("Supported formats: .mkv, .mp4, .avi, .mov")
+
+    logger.info("=" * 60)
+    logger.info("VideoProcessor test completed")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    test_video_processor()

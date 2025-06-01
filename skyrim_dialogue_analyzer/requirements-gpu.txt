@@ -1,0 +1,13 @@
+﻿# GPU-specific dependencies для RTX 5080
+torch>=1.9.0+cu118
+torchvision>=0.10.0+cu118
+torchaudio>=0.9.0+cu118
+
+# EasyOCR з GPU підтримкою
+easyocr[gpu]>=1.6.0
+
+# CUDA utilities
+cupy-cuda11x>=9.0.0
+
+# Додаткові GPU прискорення
+numba>=0.56.0
